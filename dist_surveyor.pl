@@ -2,13 +2,72 @@
 
 =head1 NAME
 
+dist_surveyor.pl - determine exactly what dist versions are installed
+
+=head1 SYNOPSIS
+
+  dist_surveyor.pl [options] /some/perl/lib/dir
+
+=head1 DESCRIPTION
+
+This utility examines all the modules installed within the specified perl
+library directory and uses the metacpan API to work out what versions of what
+distributions could have provided those modules. It then works out which of
+those candidate distributions is the most likely one. It is fairly robust and
+copes well with edge cases like installation of non-released versions from git
+repos and local modifications.
+
+It can take a long time (hours) to run for the first time on a directory with a
+large number of modules and candidate distributions. The data fetched from
+metacpan is cached so future runs are much faster.
+
+Progress and issues are reported to stderr.
+
+=head1 OPTIONS
+
+    --verbose    Show more detailed progress
+
+    --debug      Show much more information
+
+    --match R    Ignore modules that don't match regex R (unanchored)
+
+    --perlver V  Ignore modules that are shipped with perl version V
+
+    --remnants   Include old distribution versions that have left old modules behind
+
+    --uncached   Don't use or update the persistent cache
+
+    --output S   List of field names ot output, separate by spaces.
+                 
+    --format S   Printf format string with a %s for each field in --output
+
+=head1 WORKING WITH THE RESULTS
+
+Firsly you should check the results related to any modules that generated
+warnings during the run.
+
+You can use cpanm --scandeps to put the list in dependency order:
+
+    dist_surveyor.pl /some/perl/lib/dir > installed_dists.txt
+    cpanm --scandeps --format dists < installed_dists.txt > installed_dists_ordered.txt
+    cpanm --mirror http://backpan.perl.org < installed_dists_ordered.txt
+
+=head1 BUGS
+
+Probably. This utility has mutated faster than, er, a rapidly mutating thing.
+It started as a collection of hacks and has ended up only marginally better.
+The fine metacpan folk will probably want to shoot me for the load this places
+on their servers.
+
 =head1 TODO
+
+* Avoid hard-coded %distro_key_mod_names related to perllocal.pod where the
+    dist name doesn't match the key module name.
+
+* Optimise use of metacpan. Use ElasticSearch.pm.
 
 * For installed modules get the file modification time (last commit time)
     and use it to eliminate candidate dists that were released after that time.
-
-* Add partial ordering so dependencies are listed first, in install order.
-    When used with --remnants should yield the same dir tree.
 
 =cut
 
@@ -42,7 +101,6 @@ use constant ON_WIN32 => $^O eq 'MSWin32';
 use constant ON_VMS   => $^O eq 'VMS';
 
 $| = 1;
-$Storable::canonical = 1;
 
 GetOptions(
     'match=s' => \my $opt_match,
@@ -78,7 +136,7 @@ my %memoize_cache;
 if (not $opt_uncached) {
     my $db = tie %memoize_cache => 'MLDBM', $memoize_file, O_CREAT|O_RDWR, 0640
         or die "Unable to use persistent cache: $!";
-    # this locking is flawed but good enough for my needs
+    # XXX this locking is flawed but good enough for my needs
     # http://search.cpan.org/~pmqs/DB_File-1.824/DB_File.pm#HINTS_AND_TIPS
     my $fd = $db->fd;
     open(DB_FH, "+<&=$fd") || die "dup $!";
@@ -94,6 +152,7 @@ for my $subname (keys %memoize_subs) {
     my $generation = delete $memoize_args{generation} || 1;
     $memoize_args{SCALAR_CACHE} = [ HASH => \%memoize_cache ];
     $memoize_args{LIST_CACHE} = 'MERGE';
+    # XXX use faster normalizer for subs that don't get refs
     $memoize_args{NORMALIZER} = sub {
         $Storable::canonical = 1;
         sha1_base64(nfreeze([ $subname, $generation, wantarray, @_ ]))
