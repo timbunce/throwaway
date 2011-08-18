@@ -37,9 +37,22 @@ Progress and issues are reported to stderr.
 
     --uncached   Don't use or update the persistent cache
 
+    --makecpan D Create a CPAN repository in directory D
+
     --output S   List of field names ot output, separate by spaces.
                  
     --format S   Printf format string with a %s for each field in --output
+
+=head2 --makecpan
+
+Creates a CPAN repository in the specified directory by fetching the selected
+distributions into authors/id/... and writing the index files into modules/...
+
+If the directory already exists then selected distributions that already exist
+are not refetched, any distributions that already exist but aren't selected by
+this run are left in place.
+
+Currently the index files I<only index the selected distributions>. This may change.
 
 =head1 WORKING WITH THE RESULTS
 
@@ -76,18 +89,22 @@ use warnings;
 use version;
 use Carp;
 use Config;
+use CPAN::DistnameInfo;
 use Data::Dumper::Concise;
 use DBI qw(looks_like_number);
 use Digest::SHA qw(sha1_base64);
 use ExtUtils::Perllocal::Parser;
 use Fcntl qw(:DEFAULT :flock);
 use File::Fetch;
+use File::Basename;
 use File::Find;
+use File::Path;
 use File::Slurp;
 use File::Spec;
 use File::Spec::Unix;
 use Getopt::Long;
 use List::Util qw(max sum);
+use LWP::Simple;
 use Memoize;
 use MetaCPAN::API 0.32;
 use DB_File;
@@ -112,15 +129,17 @@ GetOptions(
     'remnants!' => \my $opt_remnants,
     # don't use a persistent cache
     'uncached!' => \my $opt_uncached,
+    'makecpan=s' => \my $opt_makecpan,
     # e.g., mcpani needs: download_url author modvers
     'output=s' => \(my $opt_output ||= 'url'),
     # e.g., 'mcpani --add --file %s --authorid %s --module %s
     'format=s' => \my $opt_format,
 ) or exit 1;
 
+$opt_verbose++ if $opt_debug;
 $opt_perlver = version->parse($opt_perlver || $])->numify;
 
-$opt_verbose++ if $opt_debug;
+my $major_error_count = 0; # exit status
 
 my $metacpan_size = 999; # don't make too large, hurts the server
 my $metacpan_calls = 0;
@@ -131,7 +150,7 @@ my $metacpan_api ||= MetaCPAN::API->new(
 
 # caching via persistent memoize
 
-my $memoize_file = "intuit_distros_cache.db";
+my $memoize_file = "dist_surveyor.db";
 my %memoize_cache;
 if (not $opt_uncached) {
     my $db = tie %memoize_cache => 'MLDBM', $memoize_file, O_CREAT|O_RDWR, 0640
@@ -152,7 +171,7 @@ for my $subname (keys %memoize_subs) {
     my $generation = delete $memoize_args{generation} || 1;
     $memoize_args{SCALAR_CACHE} = [ HASH => \%memoize_cache ];
     $memoize_args{LIST_CACHE} = 'MERGE';
-    # XXX use faster normalizer for subs that don't get refs
+    # TODO use faster normalizer for subs that don't get refs
     $memoize_args{NORMALIZER} = sub {
         $Storable::canonical = 1;
         sha1_base64(nfreeze([ $subname, $generation, wantarray, @_ ]))
@@ -192,10 +211,49 @@ for my $release_data (@installed_releases) {
     print "\n";
 }
 
-warn sprintf "Completed in %.1f minutes using %d metacpan calls.\n",
+warn sprintf "Completed survey in %.1f minutes using %d metacpan calls.\n",
     (time-$^T)/60, $metacpan_calls;
 
-exit 0;
+sub distname_info_from_url {
+    my ($url) = @_;
+    $url =~ s{.* \b authors/ }{authors/}x
+        or warn "No authors/ in $url\n";
+    my $di = CPAN::DistnameInfo->new($url);
+    return $di;
+}
+
+if ($opt_makecpan) {
+    warn "Updating $opt_makecpan\n";
+
+    for my $release_data (@installed_releases) {
+        my $url = $release_data->{download_url};
+        my $di = distname_info_from_url($url);
+        my $destfile = "$opt_makecpan/".$di->pathname;
+        mkpath(dirname($destfile));
+        my $mirror_status = eval { mirror($url, $destfile) };
+        if ($@ || is_error($mirror_status)) {
+            my $err = ($@ and chomp $@) ? $@ : $mirror_status;
+            my $msg = "Error $err mirroring $url to $destfile";
+            if (-f $destfile) {
+                warn "$msg - using existing file\n";
+            }
+            else {
+                # better to keep going and add the packages to the index
+                # than abort at this stage due to network/mirror problems
+                # the user can drop the files in later
+                warn "$msg - continuing, ADD FILE MANUALLY!\n";
+                ++$major_error_count;
+            }
+        }
+        else {
+            warn "$mirror_status $url\n" if $opt_verbose;
+        }
+        print "\n";
+    }
+
+}
+
+exit $major_error_count;
 
 
 
