@@ -88,6 +88,7 @@ use strict;
 use warnings;
 use version;
 use Carp;
+use Compress::Zlib;
 use Config;
 use CPAN::DistnameInfo;
 use Data::Dumper::Concise;
@@ -130,9 +131,9 @@ GetOptions(
     # don't use a persistent cache
     'uncached!' => \my $opt_uncached,
     'makecpan=s' => \my $opt_makecpan,
-    # e.g., mcpani needs: download_url author modvers
+    # e.g., 'download_url author'
     'output=s' => \(my $opt_output ||= 'url'),
-    # e.g., 'mcpani --add --file %s --authorid %s --module %s
+    # e.g., 'some-command --foo --file %s --authorid %s'
     'format=s' => \my $opt_format,
 ) or exit 1;
 
@@ -224,11 +225,15 @@ sub distname_info_from_url {
 
 if ($opt_makecpan) {
     warn "Updating $opt_makecpan\n";
+    mkpath("$opt_makecpan/modules");
 
-    for my $release_data (@installed_releases) {
-        my $url = $release_data->{download_url};
+    my %pkg_ver_rel;
+    for my $ri (@installed_releases) {
+
+        # get the file
+        my $url = $ri->{download_url};
         my $di = distname_info_from_url($url);
-        my $destfile = "$opt_makecpan/".$di->pathname;
+        my $destfile = "$opt_makecpan/authors/id/".$di->pathname;
         mkpath(dirname($destfile));
         my $mirror_status = eval { mirror($url, $destfile) };
         if ($@ || is_error($mirror_status)) {
@@ -248,8 +253,31 @@ if ($opt_makecpan) {
         else {
             warn "$mirror_status $url\n" if $opt_verbose;
         }
-        print "\n";
+
+        # accumulate package information
+        my $mods_in_rel = get_module_versions_in_release($ri->{author}, $ri->{name});
+        while ( my ($pkg, $pi) = each %$mods_in_rel ) {
+            # pi => { name=>, version=>, version_obj=> }
+            if (my $pvr = $pkg_ver_rel{$pkg}) {
+                warn "$pkg seen in $pvr->{ri}{name} overridden by $ri->{name}\n";
+            }
+            my $line = _fmtmodule($pkg, $di->pathname, $pi->{version});
+            $pkg_ver_rel{$pkg} = { line => $line, pi => $pi, ri => $ri };
+        }
+
     }
+
+    my $pkg_lines = _readpkgs($opt_makecpan);
+
+    my %packages;
+    for my $line (@$pkg_lines, map { $_->{line} } values %pkg_ver_rel) {
+        my ($pkg) = split(/\s+/, $line, 2);
+        if ($packages{$pkg} and $packages{$pkg} ne $line) {
+            warn "Old $packages{$pkg}\nNew $line\n" if $opt_verbose;
+        }
+        $packages{$pkg} = $line;
+    };
+    _writepkgs($opt_makecpan, [ sort values %packages ] );
 
 }
 
@@ -462,19 +490,16 @@ sub determine_installed_releases {
                 next; # XXX could fake some of $release_data instead
             }
 
-            my $mods_in_rel = get_module_versions_in_release($author, $release);
-
             # shortcuts
             (my $url = $release_data->{download_url}) =~ s{ .*? \b authors/ }{authors/}x;
 
             push @installed_releases, {
+                # 
                 %$release_data,
-                # handy shortcuts
+                # extra items mushed inhandy shortcuts
                 url => $url,
-                modvers => join(";", map { $_->{name}."=".($_->{version}||0) } values %$mods_in_rel),
                 # raw data structures
                 dist_data => $_->{dist},
-                mods_in_rel => $mods_in_rel,
             };
         }
         #die Dumper(\@installed_releases);
@@ -843,3 +868,69 @@ sub module_progress_indicator {
     }
 }
 
+
+# copied from CPAN::Mini::Inject and hacked
+
+sub _readpkgs {
+    my ($cpandir) = @_;
+
+    my $packages_file = $cpandir.'/modules/02packages.details.txt.gz';
+    return [] if not -f $packages_file;
+
+    my $gzread = gzopen($packages_file, 'rb')
+        or croak "Cannot open $packages_file: $gzerrno\n";
+
+    my $inheader = 1;
+    my @packages;
+    my $package;
+
+    while ( $gzread->gzreadline( $package ) ) {
+        if ( $inheader ) {
+            $inheader = 0 unless $package =~ /\S/;
+            next;
+        }
+        chomp $package;
+        push @packages, $package;
+    }
+
+    $gzread->gzclose;
+
+    return \@packages;
+}
+
+sub _writepkgs {
+    my ($cpandir, $pkgs) = @_;
+
+    my $packages_file = $cpandir.'/modules/02packages.details.txt.gz';
+    my $gzwrite = gzopen($packages_file, 'wb')
+        or croak "Cannot open $packages_file for writing: $gzerrno";
+    
+    $gzwrite->gzwrite( "File:         02packages.details.txt\n" );
+    $gzwrite->gzwrite(
+        "URL:          http://www.perl.com/CPAN/modules/02packages.details.txt\n"
+    );
+    $gzwrite->gzwrite(
+        'Description:  Package names found in directory $CPAN/authors/id/'
+        . "\n" );
+    $gzwrite->gzwrite( "Columns:      package name, version, path\n" );
+    $gzwrite->gzwrite(
+        "Intended-For: Automated fetch routines, namespace documentation.\n"
+    );
+    $gzwrite->gzwrite( "Written-By:   $0 0.001\n" ); # XXX TODO
+    $gzwrite->gzwrite( "Line-Count:   " . scalar( @$pkgs ) . "\n" );
+    # Last-Updated: Sat, 19 Mar 2005 19:49:10 GMT
+    my @date = split( /\s+/, scalar( gmtime ) );
+    $gzwrite->gzwrite( "Last-Updated: $date[0], $date[2] $date[1] $date[4] $date[3] GMT\n\n" );
+    
+    $gzwrite->gzwrite( "$_\n" ) for ( @$pkgs );
+    
+    $gzwrite->gzclose;
+}
+
+sub _fmtmodule {
+    my ( $module, $file, $version ) = @_;
+    $version = "undef" if not defined $version;
+    my $fw = 38 - length $version;
+    $fw = length $module if $fw < length $module;
+    return sprintf "%-${fw}s %s  %s", $module, $version, $file;
+}
