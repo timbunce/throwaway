@@ -72,7 +72,7 @@ It started as a collection of hacks and has ended up only marginally better.
 The fine metacpan folk will probably want to shoot me for the load this places
 on their servers.
 
-=head1 TODO
+=head1 POSSIBLE ENHANCEMENTS
 
 * Avoid hard-coded %distro_key_mod_names related to perllocal.pod where the
     dist name doesn't match the key module name.
@@ -81,6 +81,14 @@ on their servers.
 
 * For installed modules get the file modification time (last commit time)
     and use it to eliminate candidate dists that were released after that time.
+
+* Fully handle merging of pre-existing --makecpan directory data files.
+
+* Consider factoring install date in the output ordering. May help with edge cases
+    where a package P is installed via distros A then B. If A is reinstalled after B
+    then the reinstalled P will be from A but should be from B. (I don't know of any
+    cases, but it's certainly a possibility. The LWP breakup and Class::MOP spring to
+    mind as possible candidates.)
 
 =cut
 
@@ -117,6 +125,7 @@ use Storable qw(nfreeze);
 use Try::Tiny;
 use URI;
 
+use constant PROGNAME => 'dist_surveyor';
 use constant ON_WIN32 => $^O eq 'MSWin32';
 use constant ON_VMS   => $^O eq 'VMS';
 
@@ -153,7 +162,7 @@ my $metacpan_api ||= MetaCPAN::API->new(
 
 # caching via persistent memoize
 
-my $memoize_file = "dist_surveyor.db";
+my $memoize_file = PROGNAME.".db";
 my %memoize_cache;
 if (not $opt_uncached) {
     my $db = tie %memoize_cache => 'MLDBM', $memoize_file, O_CREAT|O_RDWR, 0640
@@ -215,13 +224,6 @@ for my $release_data (@installed_releases) {
 warn sprintf "Completed survey in %.1f minutes using %d metacpan calls.\n",
     (time-$^T)/60, $metacpan_calls;
 
-sub distname_info_from_url {
-    my ($url) = @_;
-    $url =~ s{.* \b authors/id/ }{}x
-        or warn "No authors/ in $url\n";
-    my $di = CPAN::DistnameInfo->new($url);
-    return $di;
-}
 
 if ($opt_makecpan) {
     warn "Updating $opt_makecpan for ".@installed_releases." releases...\n";
@@ -231,7 +233,7 @@ if ($opt_makecpan) {
     my %dist_main_pkg;
     for my $ri (@installed_releases) {
 
-        # get the file
+        # --- get the file
 
         my $main_url = URI->new($ri->{download_url});
         my $di = distname_info_from_url($main_url);
@@ -267,28 +269,45 @@ if ($opt_makecpan) {
             warn "$mirror_status $main_url\n" if $opt_verbose;
         }
 
-        # accumulate package information
+
         my $mods_in_rel = get_module_versions_in_release($ri->{author}, $ri->{name});
-        while ( my ($pkg, $pi) = each %$mods_in_rel ) {
-            # pi => { name=>, version=>, version_obj=> }
-            if (my $pvr = $pkg_ver_rel{$pkg}) {
-                warn "$pkg seen in $pvr->{ri}{name} overridden by $ri->{name}\n";
-            }
-            my $line = _fmtmodule($pkg, $di->pathname, $pi->{version});
-            $pkg_ver_rel{$pkg} = { line => $line, pi => $pi, ri => $ri };
-        }
+
+        # --- determine a 'main module' for this distro
 
         (my $dist_as_pkg = $ri->{distribution}) =~ s/-/::/g;
         $dist_as_pkg = $distro_key_mod_names{$ri->{distribution}}
             if $distro_key_mod_names{$ri->{distribution}}; # 'libwww-perl' => 'LWP'
         if (not $mods_in_rel->{$dist_as_pkg}) {
             # XXX not good - may pick a dummy test package
-            $dist_as_pkg = (keys %$mods_in_rel)[0];
+            $dist_as_pkg = (grep { $_ } keys %$mods_in_rel)[0] || $dist_as_pkg;
             warn "Picked $dist_as_pkg as main package for $ri->{distribution}\n";
         }
         $dist_main_pkg{$ri->{distribution}} = $dist_as_pkg;
 
+
+        # --- accumulate package info for 02packages file
+
+        for my $pkg (sort keys %$mods_in_rel ) {
+            # pi => { name=>, version=>, version_obj=> }
+            my $pi = $mods_in_rel->{$pkg};
+
+            if (my $pvr = $pkg_ver_rel{$pkg}) {
+                # same package name in different distributions
+                # effective heuristic: ignore if first word differs
+                if (first_word($pkg) ne first_word($dist_as_pkg)) {
+                    warn "$pkg seen in $pvr->{ri}{name} ignored, already in  $ri->{name}\n";
+                    next;
+                }
+                warn "$pkg seen in $pvr->{ri}{name} overridden by $ri->{name}\n";
+            }
+
+            my $line = _fmtmodule($pkg, $di->pathname, $pi->{version});
+            $pkg_ver_rel{$pkg} = { line => $line, pi => $pi, ri => $ri };
+        }
+
     }
+
+    # --- write 02packages file
 
     my $pkg_lines = _readpkgs($opt_makecpan);
     my %packages;
@@ -301,10 +320,37 @@ if ($opt_makecpan) {
     };
     _writepkgs($opt_makecpan, [ sort values %packages ] );
 
-    open my $key_pkg_fh, ">", "$opt_makecpan/_dist_main_pkg.txt";
-    print $key_pkg_fh "$_\n" for sort values %dist_main_pkg;
+    # --- write extra data files that may be useful XXX may change
+    # XXX these don't (yet?) merge with existing data
+    my $survey_datadump_dir = "$opt_makecpan/".PROGNAME;
+    mkpath($survey_datadump_dir);
+
+    # Write list of main packages - each should match only one release.
+    # This makes it _much_ faster to do installs via cpanm because it
+    # can skip the modules it knows are installed (whereas using a list of
+    # distros it has to reinstall _all_ of them every time).
+    my %pkg_pri = (     # install some modules before others
+        'Module::Build' => 100, # should be first
+        Moose => 50,
+        'Term::ReadKey' => -100, # tests hang
+    );
+    my @main_pkgs = sort { ($pkg_pri{$b}||0) <=> ($pkg_pri{$a}||0) or $a cmp $b } values %dist_main_pkg;
+    open my $key_pkg_fh, ">", "$survey_datadump_dir/dist_main_pkg.txt";
+    print $key_pkg_fh "$_\n" for @main_pkgs;
     close $key_pkg_fh;
 
+    # dump the primary result data for additional info and debugging
+    my $gzwrite = gzopen("$survey_datadump_dir/_data_dump.perl.gz", 'wb')
+        or croak "Cannot open $survey_datadump_dir/_data_dump.perl.gz for writing: $gzerrno";
+    $gzwrite->gzwrite("[\n");
+    for my $ri (@installed_releases) {
+        $gzwrite->gzwrite(Dumper($ri));
+        $gzwrite->gzwrite(",");
+    }
+    $gzwrite->gzwrite("]\n");
+    $gzwrite->gzclose;
+
+    warn "$opt_makecpan updated.\n"
 }
 
 exit $major_error_count;
@@ -959,4 +1005,17 @@ sub _fmtmodule {
     my $fw = 38 - length $version;
     $fw = length $module if $fw < length $module;
     return sprintf "%-${fw}s %s  %s", $module, $version, $file;
+}
+
+sub first_word {
+    my $string = shift;
+    return ($string =~ m/^(\w+)/) ? $1 : $string;
+}
+
+sub distname_info_from_url {
+    my ($url) = @_;
+    $url =~ s{.* \b authors/id/ }{}x
+        or warn "No authors/ in $url\n";
+    my $di = CPAN::DistnameInfo->new($url);
+    return $di;
 }
