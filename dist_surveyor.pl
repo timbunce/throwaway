@@ -87,6 +87,7 @@ on their servers.
 use strict;
 use warnings;
 use version;
+use autodie;
 use Carp;
 use Compress::Zlib;
 use Config;
@@ -114,6 +115,7 @@ use Module::CoreList;
 use Module::Metadata;
 use Storable qw(nfreeze);
 use Try::Tiny;
+use URI;
 
 use constant ON_WIN32 => $^O eq 'MSWin32';
 use constant ON_VMS   => $^O eq 'VMS';
@@ -163,20 +165,17 @@ if (not $opt_uncached) {
     flock (DB_FH, LOCK_EX) || die "flock: $!";
 }
 my %memoize_subs = (
-    get_candidate_cpan_dist_releases => { generation => 10 },
-    get_module_versions_in_release   => { generation => 11 },
-    dist_fraction_installed          => { generation => 10 },
+    get_candidate_cpan_dist_releases => { generation => 1 },
+    get_module_versions_in_release   => { generation => 1 },
 );
 for my $subname (keys %memoize_subs) {
     my %memoize_args = %{$memoize_subs{$subname}};
     my $generation = delete $memoize_args{generation} || 1;
     $memoize_args{SCALAR_CACHE} = [ HASH => \%memoize_cache ];
-    $memoize_args{LIST_CACHE} = 'MERGE';
+    $memoize_args{LIST_CACHE}   = 'FAULT';
     # TODO use faster normalizer for subs that don't get refs
-    $memoize_args{NORMALIZER} = sub {
-        $Storable::canonical = 1;
-        sha1_base64(nfreeze([ $subname, $generation, wantarray, @_ ]))
-    };
+    # not needed because we don't pass refs
+    #$memoize_args{NORMALIZER} = sub { $Storable::canonical = 1; sha1_base64(nfreeze([ $subname, $generation, wantarray, @_ ])) }
     memoize($subname, %memoize_args);
 }
 
@@ -191,6 +190,7 @@ my %distro_key_mod_names = (
     'Template-Toolkit' => 'Template',
     'TermReadKey' => 'Term::ReadKey',
     'libwww-perl' => 'LWP',
+    'ack' => 'App::ack',
 );
 
 
@@ -217,28 +217,41 @@ warn sprintf "Completed survey in %.1f minutes using %d metacpan calls.\n",
 
 sub distname_info_from_url {
     my ($url) = @_;
-    $url =~ s{.* \b authors/ }{authors/}x
+    $url =~ s{.* \b authors/id/ }{}x
         or warn "No authors/ in $url\n";
     my $di = CPAN::DistnameInfo->new($url);
     return $di;
 }
 
 if ($opt_makecpan) {
-    warn "Updating $opt_makecpan\n";
+    warn "Updating $opt_makecpan for ".@installed_releases." releases...\n";
     mkpath("$opt_makecpan/modules");
 
-    my %pkg_ver_rel;
+    my %pkg_ver_rel;    # for 02packages
+    my %dist_main_pkg;
     for my $ri (@installed_releases) {
 
         # get the file
-        my $url = $ri->{download_url};
-        my $di = distname_info_from_url($url);
-        my $destfile = "$opt_makecpan/authors/id/".$di->pathname;
+
+        my $main_url = URI->new($ri->{download_url});
+        my $di = distname_info_from_url($main_url);
+        my $pathfile = "authors/id/".$di->pathname;
+        my $destfile = "$opt_makecpan/$pathfile";
         mkpath(dirname($destfile));
-        my $mirror_status = eval { mirror($url, $destfile) };
+
+        my @urls = ($main_url);
+        for my $mirror ('http://backpan.perl.org') {
+            push @urls, "$mirror/$pathfile";
+        }
+
+        my $mirror_status;
+        for my $url (@urls) {
+            $mirror_status = eval { mirror($url, $destfile) };
+            last if not is_error($mirror_status||500);
+        }
         if ($@ || is_error($mirror_status)) {
             my $err = ($@ and chomp $@) ? $@ : $mirror_status;
-            my $msg = "Error $err mirroring $url to $destfile";
+            my $msg = "Error $err mirroring $main_url";
             if (-f $destfile) {
                 warn "$msg - using existing file\n";
             }
@@ -251,7 +264,7 @@ if ($opt_makecpan) {
             }
         }
         else {
-            warn "$mirror_status $url\n" if $opt_verbose;
+            warn "$mirror_status $main_url\n" if $opt_verbose;
         }
 
         # accumulate package information
@@ -265,10 +278,19 @@ if ($opt_makecpan) {
             $pkg_ver_rel{$pkg} = { line => $line, pi => $pi, ri => $ri };
         }
 
+        (my $dist_as_pkg = $ri->{distribution}) =~ s/-/::/g;
+        $dist_as_pkg = $distro_key_mod_names{$ri->{distribution}}
+            if $distro_key_mod_names{$ri->{distribution}}; # 'libwww-perl' => 'LWP'
+        if (not $mods_in_rel->{$dist_as_pkg}) {
+            # XXX not good - may pick a dummy test package
+            $dist_as_pkg = (keys %$mods_in_rel)[0];
+            warn "Picked $dist_as_pkg as main package for $ri->{distribution}\n";
+        }
+        $dist_main_pkg{$ri->{distribution}} = $dist_as_pkg;
+
     }
 
     my $pkg_lines = _readpkgs($opt_makecpan);
-
     my %packages;
     for my $line (@$pkg_lines, map { $_->{line} } values %pkg_ver_rel) {
         my ($pkg) = split(/\s+/, $line, 2);
@@ -278,6 +300,10 @@ if ($opt_makecpan) {
         $packages{$pkg} = $line;
     };
     _writepkgs($opt_makecpan, [ sort values %packages ] );
+
+    open my $key_pkg_fh, ">", "$opt_makecpan/_dist_main_pkg.txt";
+    print $key_pkg_fh "$_\n" for sort values %dist_main_pkg;
+    close $key_pkg_fh;
 
 }
 
