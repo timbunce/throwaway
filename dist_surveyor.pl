@@ -17,11 +17,13 @@ those candidate distributions is the most likely one. It is fairly robust and
 copes well with edge cases like installation of non-released versions from git
 repos and local modifications.
 
-It can take a long time (hours) to run for the first time on a directory with a
-large number of modules and candidate distributions. The data fetched from
-metacpan is cached so future runs are much faster.
-
 Progress and issues are reported to stderr.
+
+It can take a long time to run for the first time on a directory with a
+large number of modules and candidate distributions.  The data fetched from
+metacpan is cached so future runs are much faster.  (The system this code was
+tested on took about 60 minutes to process around 500 distributions with no cached
+data, and under 10 minutes with.)
 
 =head1 OPTIONS
 
@@ -81,6 +83,12 @@ on their servers.
 
 * For installed modules get the file modification time (last commit time)
     and use it to eliminate candidate dists that were released after that time.
+
+* Add support for matching Foo.pm.PL files (e.g. FCGI and common::sense)
+
+* Consider factoring in release status ('authorized') so rogue releases
+    that ship copies of many other modules (like Net-Braintree-0.1.1)
+    are given a lower priority.
 
 * Fully handle merging of pre-existing --makecpan directory data files.
 
@@ -162,9 +170,11 @@ my $metacpan_api ||= MetaCPAN::API->new(
 
 # caching via persistent memoize
 
-my $memoize_file = PROGNAME.".db";
+my $db_generation = 1; # XXX increment on incompatible change
+my $memoize_file = PROGNAME."-$db_generation.db";
 my %memoize_cache;
 if (not $opt_uncached) {
+    # XXX no need for MLDBM now? Could just use DB_File
     my $db = tie %memoize_cache => 'MLDBM', $memoize_file, O_CREAT|O_RDWR, 0640
         or die "Unable to use persistent cache: $!";
     # XXX this locking is flawed but good enough for my needs
@@ -292,13 +302,15 @@ if ($opt_makecpan) {
             my $pi = $mods_in_rel->{$pkg};
 
             if (my $pvr = $pkg_ver_rel{$pkg}) {
-                # same package name in different distributions
-                # effective heuristic: ignore if first word differs
-                if (first_word($pkg) ne first_word($dist_as_pkg)) {
-                    warn "$pkg seen in $pvr->{ri}{name} ignored, already in  $ri->{name}\n";
+                # already seen same package name in different distribution
+                # heuristic: prefer dist with same first word
+                # XXX better to calculate and store a match quality and
+                # then ignore new if lower quality then existing match
+                if (first_word($pkg) eq first_word($pvr->{ri}{name})) {
+                    warn "$pkg seen in $pvr->{ri}{name} so ignoring one in $ri->{name}\n";
                     next;
                 }
-                warn "$pkg seen in $pvr->{ri}{name} overridden by $ri->{name}\n";
+                warn "$pkg seen in $pvr->{ri}{name} - now overridden by $ri->{name}\n";
             }
 
             my $line = _fmtmodule($pkg, $di->pathname, $pi->{version});
@@ -615,6 +627,9 @@ sub dist_fraction_installed {
     my $mods_in_rel_count = keys %$mods_in_rel;
     my $mods_inst_count = sum( map {
         my $mi = $installed_mod_info->{ $_->{name} };
+        # XXX we stash the version_obj into the mods_in_rel hash
+        # (though with little/no caching effect with current setup)
+        $_->{version_obj} ||= eval { version->parse($_->{version}) };
         my $hit = ($mi && $mi->{version_obj} == $_->{version_obj}) ? 1 : 0;
         # XXX demote to a low-scoring partial match if the file size differs
         $hit = 0.1 if $mi && $mi->{size} != $_->{size};
@@ -753,13 +768,12 @@ sub get_module_versions_in_release {
                 next;
             }
 
-            # add version_obj to simplify later version checks
-            my $version_obj = eval { version->parse($mod->{version}) };
-            die "$author/$release: $mod $mod->{version}: $@" if $@;
-
             # warn if package previously seen in this release
             # with a different version or file size
             if (my $prev = $modules_in_release{$mod->{name}}) {
+                my $version_obj = eval { version->parse($mod->{version}) };
+                die "$author/$release: $mod $mod->{version}: $@" if $@;
+
                 # XXX could add a show-only-once cache here
                 my $msg = "$mod->{name} $version_obj ($size) seen in $path after $prev->{path} $prev->{version_obj} ($prev->{size})";
                 warn "$release: $msg\n"
@@ -767,17 +781,18 @@ sub get_module_versions_in_release {
                         or $size != $prev->{size});
             }
 
+            # keep result small as Storable thawing this is major runtime cost
+            # (specifically we avoid storing a version_obj here)
             $modules_in_release{$mod->{name}} = {
                 name => $mod->{name},
                 path => $path,
                 version => $mod->{version},
-                version_obj => $version_obj,
                 size => $size,
             };
         }
     }
 
-    warn "\n$author/$release contains: @{[ map { qq($_->{name} $_->{version_obj}) } values %modules_in_release ]}\n"
+    warn "\n$author/$release contains: @{[ map { qq($_->{name} $_->{version}) } values %modules_in_release ]}\n"
         if $opt_debug;
 
     return \%modules_in_release;
