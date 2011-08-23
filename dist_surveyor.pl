@@ -444,8 +444,10 @@ sub determine_installed_releases {
                         if $mod_version or $opt_verbose;
                     $mi->{file_size_mismatch}++;
                 }
-                elsif (0) {
-                    die "hack for common::sense and similar .pm.PL ?";
+                elsif ($ccdr = get_candidate_cpan_dist_releases_fallback($module, $mod_version) and %$ccdr) {
+                    warn "$module $mod_version not on CPAN but assumed to be from @{[ sort keys %$ccdr ]}\n"
+                        if $mod_version or $opt_verbose;
+                    $mi->{cpan_dist_fallback}++;
                 }
                 else {
                     $mi->{version_not_on_cpan}++;
@@ -714,13 +716,77 @@ sub get_candidate_cpan_dist_releases {
     for my $hit (@$hits) {
         $hit->{release_id} = delete $hit->{_parent};
         # add version_obj for convenience
-        $hit->{fields}{version_obj} = eval { version->parse($hit->{version}) }
-            or die "get_candidate_cpan_dist_releases($module, $version, $file_size): error parsing $hit->{path} $hit->{version}: $@";
+        $hit->{fields}{version_obj} = eval { version->parse($hit->{fields}{version}) }
+            or die "get_candidate_cpan_dist_releases($module, $version, $file_size): error parsing $hit->{path} $hit->{fields}{version}: $@";
     }
 
     # we'll return { "Dist-Name-Version" => { details }, ... }
     my %dists = map { $_->{fields}{release} => $_->{fields} } @$hits;
     warn "get_candidate_cpan_dist_releases($module, $version, $file_size): @{[ sort keys %dists ]}\n"
+        if $opt_verbose;
+
+    return \%dists;
+}
+
+sub get_candidate_cpan_dist_releases_fallback {
+    my ($module, $version) = @_;
+
+    # fallback to look for distro of the same name as the module
+    # for odd cases like
+    # http://explorer.metacpan.org/?url=/module/MLEHMANN/common-sense-3.4/sense.pm.PL
+    (my $distname = $module) =~ s/::/-/g;
+
+    # timbunce: So, the current situation is that: version_numified is a float
+    # holding version->parse($raw_version)->numify, and version is a string
+    # also holding version->parse($raw_version)->numify at the moment, and
+    # that'll change to ->stringify at some point. Is that right now? 
+    # mo: yes, I already patched the indexer, so new releases are already
+    # indexed ok, but for older ones I need to reindex cpan
+    my $v = (ref $version && $version->isa('version')) ? $version : version->parse($version);
+    my %v = map { $_ => 1 } "$version", $v->stringify, $v->numify;
+    my @version_qual;
+    push @version_qual, { term => { "version" => $_ } }
+        for keys %v;
+    push @version_qual, { term => { "version_numified" => $_ }}
+        for grep { looks_like_number($_) } keys %v;
+
+    my @and_quals = (
+        {"term" => {"distribution" => $distname }},
+        (@version_qual > 1 ? { "or" => \@version_qual } : $version_qual[0]),
+    );
+
+    # XXX doesn't cope with odd cases like 
+    $metacpan_calls++;
+    my $results = $metacpan_api->post("file", {
+        "size" => $metacpan_size,
+        "query" =>  { "filtered" => {
+            "filter" => {"and" => \@and_quals },
+            "query" => {"match_all" => {}},
+        }},
+        "fields" => [qw(release _parent author version version_numified file.module.version file.module.version_numified date stat.mtime distribution)]
+    });
+
+    my $hits = $results->{hits}{hits};
+    die "get_candidate_cpan_dist_releases_fallback($module, $version): too many results (>$metacpan_size)"
+        if @$hits >= $metacpan_size;
+    warn "get_candidate_cpan_dist_releases_fallback($module, $version): ".Dumper($results)
+        if grep { not $_->{fields}{release} } @$hits; # XXX temp, seen once but not since
+
+    # filter out perl-like releases
+    @$hits = grep {
+        $_->{fields}{release} !~ /^(perl|ponie|parrot|kurila|SiePerl-5.6.1-)/;
+    } @$hits;
+
+    for my $hit (@$hits) {
+        $hit->{release_id} = delete $hit->{_parent};
+        # add version_obj for convenience
+        $hit->{fields}{version_obj} = eval { version->parse($hit->{fields}{version}) }
+            or die "get_candidate_cpan_dist_releases_fallback($module, $version): error parsing $hit->{version}: $@";
+    }
+
+    # we'll return { "Dist-Name-Version" => { details }, ... }
+    my %dists = map { $_->{fields}{release} => $_->{fields} } @$hits;
+    warn "get_candidate_cpan_dist_releases_fallback($module, $version): @{[ sort keys %dists ]}\n"
         if $opt_verbose;
 
     return \%dists;
