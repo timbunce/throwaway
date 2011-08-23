@@ -17,7 +17,7 @@ those candidate distributions is the most likely one. It is fairly robust and
 copes well with edge cases like installation of non-released versions from git
 repos and local modifications.
 
-Progress and issues are reported to stderr.
+Distributions are written to stdout. Progress and issues are reported to stderr.
 
 It can take a long time to run for the first time on a directory with a
 large number of modules and candidate distributions.  The data fetched from
@@ -63,14 +63,21 @@ warnings during the run.
 
 You can use cpanm --scandeps to put the list in dependency order:
 
-    dist_surveyor.pl /some/perl/lib/dir > installed_dists.txt
-    cpanm --scandeps --format dists < installed_dists.txt > installed_dists_ordered.txt
-    cpanm --mirror http://backpan.perl.org < installed_dists_ordered.txt
+    dist_surveyor.pl --makecpan my_cpan /some/perl/lib/dir > installed_dists.txt
+    cpanm --mirror file:$PWD/my_cpan [--mirror-only] -l new_lib < installed_dists.txt
+
+That will always reinstall all the listed distributions. If some distributions
+fail to install (typically due to test failures) then it's much faster to use the
+'main package list':
+
+    cpanm --mirror file:$PWD/my_cpan [--mirror-only] -l new_lib < my_cpan/dist_surveyor/dist_main_pkg.txt
+
+Using package name allows cpanm to skip those that it knows are already installed.
 
 =head1 BUGS
 
-Probably. This utility has mutated faster than, er, a rapidly mutating thing.
-It started as a collection of hacks and has ended up only marginally better.
+Probably.
+
 The fine metacpan folk will probably want to shoot me for the load this places
 on their servers.
 
@@ -341,6 +348,7 @@ if ($opt_makecpan) {
     # This makes it _much_ faster to do installs via cpanm because it
     # can skip the modules it knows are installed (whereas using a list of
     # distros it has to reinstall _all_ of them every time).
+    # XXX maybe add as a separate option: "--mainpkgs mainpkgs.lst"
     my %pkg_pri = (     # install some modules before others
         'Module::Build' => 100, # should be first
         Moose => 50,
@@ -436,11 +444,16 @@ sub determine_installed_releases {
                         if $mod_version or $opt_verbose;
                     $mi->{file_size_mismatch}++;
                 }
+                elsif (0) {
+                    die "hack for common::sense and similar .pm.PL ?";
+                }
                 else {
                     $mi->{version_not_on_cpan}++;
-                    # Possibly a local change/patch or installed direct from repo
-                    # with a version number that was never released.
-                    # Also possibly a private module never released on cpan.
+                    # Possibly:
+                    # - a local change/patch or installed direct from repo
+                    #   with a version number that was never released.
+                    # - a private module never released on cpan.
+                    # - a build-time create module eg common/sense.pm.PL
                     warn "$module $mod_version not found on CPAN\n"
                         if $mi->{version} # no version implies uninteresting
                         or $opt_verbose;
@@ -550,7 +563,7 @@ sub determine_installed_releases {
         }
 
         if (@remnant_dists or $opt_debug) {
-            warn "@{[ map { $_->{dist}{release} } @dist_by_fraction ]}:\n"; 
+            warn "@{[ map { $_->{dist}{release} } @dist_by_fraction ]}: (Selected release is first)\n"; 
             for ($installed_dist, @remnant_dists) {
                 my $fi = $_->{dist}{fraction_installed};
                 my $modules = $_->{modules};
@@ -701,8 +714,8 @@ sub get_candidate_cpan_dist_releases {
     for my $hit (@$hits) {
         $hit->{release_id} = delete $hit->{_parent};
         # add version_obj for convenience
-        $hit->{fields}{version_obj} = eval { version->parse($hit->{version}) };
-        die "get_candidate_cpan_dist_releases($module, $version, $file_size): error parsing $hit->{path} $hit->{version}: $@" if $@;
+        $hit->{fields}{version_obj} = eval { version->parse($hit->{version}) }
+            or die "get_candidate_cpan_dist_releases($module, $version, $file_size): error parsing $hit->{path} $hit->{version}: $@";
     }
 
     # we'll return { "Dist-Name-Version" => { details }, ... }
