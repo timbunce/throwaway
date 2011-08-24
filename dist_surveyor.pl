@@ -68,9 +68,9 @@ You can use cpanm --scandeps to put the list in dependency order:
 
 That will always reinstall all the listed distributions. If some distributions
 fail to install (typically due to test failures) then it's much faster to use the
-'main package list':
+'token package list':
 
-    cpanm --mirror file:$PWD/my_cpan [--mirror-only] -l new_lib < my_cpan/dist_surveyor/dist_main_pkg.txt
+    cpanm --mirror file:$PWD/my_cpan [--mirror-only] -l new_lib < my_cpan/dist_surveyor/token_packages.txt
 
 Using package name allows cpanm to skip those that it knows are already installed.
 
@@ -227,16 +227,7 @@ unshift @libdir, "$libdir[0]/$Config{archname}"
     if -d "$libdir[0]/$Config{archname}";
 
 my @installed_releases = determine_installed_releases(@libdir);
-
-my @fields = split ' ', $opt_output;
-my $format = $opt_format ? $opt_format : join("\t", ('%s') x @fields);
-for my $release_data (@installed_releases) {
-    my @values = map {
-        exists $release_data->{$_} ? $release_data->{$_} : "$_?"
-    } @fields;
-    printf $format, @values;
-    print "\n";
-}
+write_fields(\@installed_releases, $opt_format, [split ' ', $opt_output], \*STDOUT);
 
 warn sprintf "Completed survey in %.1f minutes using %d metacpan calls.\n",
     (time-$^T)/60, $metacpan_calls;
@@ -247,7 +238,6 @@ if ($opt_makecpan) {
     mkpath("$opt_makecpan/modules");
 
     my %pkg_ver_rel;    # for 02packages
-    my %dist_main_pkg;
     for my $ri (@installed_releases) {
 
         # --- get the file
@@ -289,19 +279,8 @@ if ($opt_makecpan) {
 
         my $mods_in_rel = get_module_versions_in_release($ri->{author}, $ri->{name});
 
-        # --- determine a 'main module' for this distro
-
-        (my $dist_as_pkg = $ri->{distribution}) =~ s/-/::/g;
-        $dist_as_pkg = $distro_key_mod_names{$ri->{distribution}}
-            if $distro_key_mod_names{$ri->{distribution}}; # 'libwww-perl' => 'LWP'
-        if (not $mods_in_rel->{$dist_as_pkg}) {
-            # XXX not good - may pick a dummy test package
-            $dist_as_pkg = (grep { $_ } keys %$mods_in_rel)[0] || $dist_as_pkg;
-            warn "Picked $dist_as_pkg as main package for $ri->{distribution}\n";
-        }
-        $dist_main_pkg{$ri->{distribution}} = $dist_as_pkg;
-
         if (!keys %$mods_in_rel) { # XXX hack for common::sense
+            (my $dist_as_pkg = $ri->{distribution}) =~ s/-/::/g;
             warn "$ri->{author}/$ri->{name} has no modules! Adding fake module $dist_as_pkg ".$di->version."\n";
             $mods_in_rel->{$dist_as_pkg} = {
                 name => $dist_as_pkg,
@@ -317,12 +296,13 @@ if ($opt_makecpan) {
             # pi => { name=>, version=>, version_obj=> }
             my $pi = $mods_in_rel->{$pkg};
 
+            # for selecting which dist a package belongs to
+            # XXX should factor in authorization status
+            my $p_r_match_score = p_r_match_score($pkg, $ri);
+
             if (my $pvr = $pkg_ver_rel{$pkg}) {
                 # already seen same package name in different distribution
-                # heuristic: prefer dist with same first word
-                # XXX better to calculate and store a match quality and
-                # then ignore new if lower quality then existing match
-                if (first_word($pkg) eq first_word($pvr->{ri}{name})) {
+                if ($p_r_match_score < $pvr->{p_r_match_score}) {
                     warn "$pkg seen in $pvr->{ri}{name} so ignoring one in $ri->{name}\n";
                     next;
                 }
@@ -330,10 +310,11 @@ if ($opt_makecpan) {
             }
 
             my $line = _fmtmodule($pkg, $di->pathname, $pi->{version});
-            $pkg_ver_rel{$pkg} = { line => $line, pi => $pi, ri => $ri };
+            $pkg_ver_rel{$pkg} = { line => $line, pi => $pi, ri => $ri, p_r_match_score => $p_r_match_score };
         }
 
     }
+
 
     # --- write 02packages file
 
@@ -348,25 +329,56 @@ if ($opt_makecpan) {
     };
     _writepkgs($opt_makecpan, [ sort values %packages ] );
 
+
     # --- write extra data files that may be useful XXX may change
-    # XXX these don't (yet?) merge with existing data
+    # XXX these don't all (yet?) merge with existing data
     my $survey_datadump_dir = "$opt_makecpan/".PROGNAME;
     mkpath($survey_datadump_dir);
 
-    # Write list of main packages - each should match only one release.
+    # Write list of token packages - each should match only one release.
     # This makes it _much_ faster to do installs via cpanm because it
     # can skip the modules it knows are installed (whereas using a list of
     # distros it has to reinstall _all_ of them every time).
     # XXX maybe add as a separate option: "--mainpkgs mainpkgs.lst"
-    my %pkg_pri = (     # install some modules before others
-        'Module::Build' => 100, # should be first
+    my %dist_packages;
+    while ( my ($pkg, $line) = each %packages) {
+        my $distpath = (split /\s+/, $line)[2];
+        $dist_packages{$distpath}{$pkg}++;
+    }
+    my %token_package;
+    my %token_package_pri = (       # install some modules before others
+        'Module::Build' => 100,     # should be near first
         Moose => 50,
-        'Term::ReadKey' => -100, # tests hang
+        'Term::ReadKey' => -100,    # tests hang if run in background
     );
-    my @main_pkgs = sort { ($pkg_pri{$b}||0) <=> ($pkg_pri{$a}||0) or $a cmp $b } values %dist_main_pkg;
-    open my $key_pkg_fh, ">", "$survey_datadump_dir/dist_main_pkg.txt";
+    for my $distpath (sort keys %dist_packages) {
+        my $dp = $dist_packages{$distpath};
+        my $di = CPAN::DistnameInfo->new($distpath);
+        #warn Dumper([ $distpath, $di->dist, $di]);
+        (my $token_pkg = $di->dist) =~ s/-/::/;
+        if (!$dp->{$token_pkg}) {
+            if (my $keypkg = $distro_key_mod_names{$di->dist}) {
+                $token_pkg = $keypkg;
+            }
+            else {
+                # XXX not good - may pick a dummy test package
+                warn "$token_pkg [$distpath]";
+                $token_pkg = (grep { $_ } keys %$dp)[0] || $token_pkg;
+                warn "Picked $token_pkg as token package for ".$di->distvname." (@{[ keys %$dp ]})\n";
+            }
+        }
+        $token_package{$token_pkg} = $token_package_pri{$token_pkg} || 0;
+    }
+
+    my @main_pkgs = sort { $token_package{$b} <=> $token_package{$a} or $a cmp $b } keys %token_package;
+    open my $key_pkg_fh, ">", "$survey_datadump_dir/token_packages.txt";
     print $key_pkg_fh "$_\n" for @main_pkgs;
     close $key_pkg_fh;
+
+    # Write list of releases, like default stdout
+    open my $rel_fh, ">", "$survey_datadump_dir/releases.txt";
+    write_fields(\@installed_releases, undef, [qw(url)], $rel_fh);
+    close $rel_fh;
 
     # dump the primary result data for additional info and debugging
     my $gzwrite = gzopen("$survey_datadump_dir/_data_dump.perl.gz", 'wb')
@@ -385,6 +397,32 @@ if ($opt_makecpan) {
 exit $major_error_count;
 
 
+
+sub p_r_match_score {
+    my ($pkg_name, $ri) = @_;
+    my @p = split /\W/, $pkg_name;
+    my @r = split /\W/, $ri->{name};
+    for my $i (0..max(scalar @p, scalar @r)) {
+        return $i if not defined $p[$i]
+                  or not defined $r[$i]
+                  or $p[$i] ne $r[$i]
+    }
+    die; # unreached
+}
+
+
+sub write_fields {
+    my ($releases, $format, $fields, $fh) = @_;
+
+    $format ||= join("\t", ('%s') x @$fields);
+    $format .= "\n";
+
+    for my $release_data (@$releases) {
+        printf $fh $format, map {
+            exists $release_data->{$_} ? $release_data->{$_} : "?$_"
+        } @$fields;
+    }
+}
 
 
 sub determine_installed_releases {
@@ -437,6 +475,9 @@ sub determine_installed_releases {
             version_obj => version->parse($mod_version),
             size => $mod_file_size,
         };
+
+        # ignore modules we know aren't indexed
+        next if $module =~ /^Moose::Meta::Method::Accessor::Native::/;
 
         # XXX could also consider file mtime: releases newer than the mtime
         # of the module file can't be the origin of that module file.
@@ -574,7 +615,9 @@ sub determine_installed_releases {
         }
 
         if (@remnant_dists or $opt_debug) {
-            warn "@{[ map { $_->{dist}{release} } @dist_by_fraction ]}: (Selected release is first)\n"; 
+            warn "Distributions with remnants (chosen release is first):\n"
+                unless our $dist_with_remnants_warning++;
+            warn "@{[ map { $_->{dist}{release} } @dist_by_fraction ]}\n"; 
             for ($installed_dist, @remnant_dists) {
                 my $fi = $_->{dist}{fraction_installed};
                 my $modules = $_->{modules};
@@ -1119,7 +1162,7 @@ sub first_word {
 sub distname_info_from_url {
     my ($url) = @_;
     $url =~ s{.* \b authors/id/ }{}x
-        or warn "No authors/ in $url\n";
+        or warn "No authors/ in '$url'\n";
     my $di = CPAN::DistnameInfo->new($url);
     return $di;
 }
