@@ -355,16 +355,15 @@ if ($opt_makecpan) {
         my $dp = $dist_packages{$distpath};
         my $di = CPAN::DistnameInfo->new($distpath);
         #warn Dumper([ $distpath, $di->dist, $di]);
-        (my $token_pkg = $di->dist) =~ s/-/::/;
+        (my $token_pkg = $di->dist) =~ s/-/::/g;
         if (!$dp->{$token_pkg}) {
             if (my $keypkg = $distro_key_mod_names{$di->dist}) {
                 $token_pkg = $keypkg;
             }
             else {
                 # XXX not good - may pick a dummy test package
-                warn "$token_pkg [$distpath]";
                 $token_pkg = (grep { $_ } keys %$dp)[0] || $token_pkg;
-                warn "Picked $token_pkg as token package for ".$di->distvname." (@{[ keys %$dp ]})\n";
+                warn "Picked $token_pkg as token package for ".$di->distvname."\n";
             }
         }
         $token_package{$token_pkg} = $token_package_pri{$token_pkg} || 0;
