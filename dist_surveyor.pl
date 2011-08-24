@@ -301,6 +301,15 @@ if ($opt_makecpan) {
         }
         $dist_main_pkg{$ri->{distribution}} = $dist_as_pkg;
 
+        if (!keys %$mods_in_rel) { # XXX hack for common::sense
+            warn "$ri->{author}/$ri->{name} has no modules! Adding fake module $dist_as_pkg ".$di->version."\n";
+            $mods_in_rel->{$dist_as_pkg} = {
+                name => $dist_as_pkg,
+                version => $di->version,
+                version_obj => version->parse($di->version),
+            };
+        }
+
 
         # --- accumulate package info for 02packages file
 
@@ -646,7 +655,8 @@ sub dist_fraction_installed {
         # (though with little/no caching effect with current setup)
         $_->{version_obj} ||= eval { version->parse($_->{version}) };
         my $hit = ($mi && $mi->{version_obj} == $_->{version_obj}) ? 1 : 0;
-        # XXX demote to a low-scoring partial match if the file size differs
+        # demote to a low-scoring partial match if the file size differs
+        # XXX this isn't good as the effect varies with the number of modules
         $hit = 0.1 if $mi && $mi->{size} != $_->{size};
         warn sprintf "%s %s %s %s: %s\n", $tag, $_->{name}, $_->{version_obj}, $_->{size},
                 ($hit == 1) ? "matches"
