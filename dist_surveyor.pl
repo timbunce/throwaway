@@ -22,8 +22,9 @@ Distributions are written to stdout. Progress and issues are reported to stderr.
 It can take a long time to run for the first time on a directory with a
 large number of modules and candidate distributions.  The data fetched from
 metacpan is cached so future runs are much faster.  (The system this code was
-tested on took about 60 minutes to process around 500 distributions with no cached
-data, and under 10 minutes with.)
+tested on took about 60 minutes to process around 500 distributions with no
+cached data, and under 10 minutes for later runs that coud reuse the cached
+data. The cache file ended up about 40MB in size.)
 
 =head1 OPTIONS
 
@@ -54,7 +55,14 @@ If the directory already exists then selected distributions that already exist
 are not refetched, any distributions that already exist but aren't selected by
 this run are left in place.
 
-Currently the index files I<only index the selected distributions>. This may change.
+New package distribution information is merged into the modules/02packages index file.
+
+Some additional files are written into a dist_surveyor subdirectory:
+
+=head3 dist_surveyor/token_packages.txt
+
+This file lists one unique 'token package' per distribution. It's very useful
+to speed up re-running a full install after some distributions have failed.
 
 =head1 WORKING WITH THE RESULTS
 
@@ -216,7 +224,7 @@ my %distro_key_mod_names = (
     'Template-Toolkit' => 'Template',
     'TermReadKey' => 'Term::ReadKey',
     'libwww-perl' => 'LWP',
-    'ack' => 'App::ack',
+    'ack' => 'App::Ack',
 );
 
 
@@ -906,10 +914,10 @@ sub get_module_versions_in_release {
                 die "$author/$release: $mod $mod->{version}: $@" if $@;
 
                 # XXX could add a show-only-once cache here
-                my $msg = "$mod->{name} $version_obj ($size) seen in $path after $prev->{path} $prev->{version_obj} ($prev->{size})";
+                my $msg = "$mod->{name} $mod->{version} ($size) seen in $path after $prev->{path} $prev->{version} ($prev->{size})";
                 warn "$release: $msg\n"
-                    if $opt_verbose and ($version_obj != $prev->{version_obj}
-                        or $size != $prev->{size});
+                    if $opt_verbose
+                    and ($version_obj != version->parse($prev->{version}) or $size != $prev->{size});
             }
 
             # keep result small as Storable thawing this is major runtime cost
