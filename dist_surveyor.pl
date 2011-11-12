@@ -91,6 +91,11 @@ on their servers.
 
 =head1 POSSIBLE ENHANCEMENTS
 
+* Auto-detect when directory given isn't the root of a perl library dir tree.
+    E.g. by matching file names to module names
+
+* Sort out ExtUtils::Perllocal::Parser situation
+
 * Avoid hard-coded %distro_key_mod_names related to perllocal.pod where the
     dist name doesn't match the key module name.
 
@@ -126,7 +131,6 @@ use CPAN::DistnameInfo;
 use Data::Dumper::Concise;
 use DBI qw(looks_like_number);
 use Digest::SHA qw(sha1_base64);
-use ExtUtils::Perllocal::Parser;
 use Fcntl qw(:DEFAULT :flock);
 use File::Fetch;
 use File::Basename;
@@ -231,8 +235,9 @@ my %distro_key_mod_names = (
 # give only top-level lib dir, the archlib will be added automatically
 my @libdir = shift;
 die "$libdir[0] isn't a directory\n" unless -d $libdir[0];
-unshift @libdir, "$libdir[0]/$Config{archname}"
-    if -d "$libdir[0]/$Config{archname}";
+if (-d (my $archdir = "$libdir[0]/$Config{archname}")) {
+    unshift @libdir, $archdir;
+}
 
 my @installed_releases = determine_installed_releases(@libdir);
 write_fields(\@installed_releases, $opt_format, [split ' ', $opt_output], \*STDOUT);
@@ -354,9 +359,16 @@ if ($opt_makecpan) {
         $dist_packages{$distpath}{$pkg}++;
     }
     my %token_package;
-    my %token_package_pri = (       # install some modules before others
+    my %token_package_pri = (       # alter install order for some modules
         'Module::Build' => 100,     # should be near first
         Moose => 50,
+
+        # install distros that use Module::Install late so their dependencies
+        # have already been resolved (else they try to fetch them directly,
+        # bypassing our cpanm --mirror-only goal)
+        'Olson::Abbreviations' => -90,
+
+        # distros with special needs
         'Term::ReadKey' => -100,    # tests hang if run in background
     );
     for my $distpath (sort keys %dist_packages) {
@@ -614,17 +626,23 @@ sub determine_installed_releases {
             # this is the common case: we'll assume that's installed and the
             # rest are remnants of earlier versions
         }
+        elsif ($dist_by_fraction[-1]{dist}{fraction_installed} == 100) {
+            warn "Unsure which $distname is installed from among @{[ keys %$releases ]}\n";
+            @remnant_dists  = @dist_by_fraction;
+            $installed_dist = pop @remnant_dists;
+            warn "Selecting the one that apprears to be 100% installed\n";
+        }
         else {
             # else grumble so the user knows to ponder the possibilities
-            warn "\tCan't determine which $distname is installed from among @{[ keys %$releases ]}\n";
-            warn Dumper([ \@dist_by_version, \@dist_by_fraction ]);
+            warn "Can't determine which $distname is installed from among @{[ keys %$releases ]}\n";
+            warn Dumper([\@dist_by_version, \@dist_by_fraction]);
             warn "\tSelecting based on latest version\n";
         }
 
         if (@remnant_dists or $opt_debug) {
             warn "Distributions with remnants (chosen release is first):\n"
                 unless our $dist_with_remnants_warning++;
-            warn "@{[ map { $_->{dist}{release} } @dist_by_fraction ]}\n"; 
+            warn "@{[ map { $_->{dist}{release} } reverse @dist_by_fraction ]}\n"; 
             for ($installed_dist, @remnant_dists) {
                 my $fi = $_->{dist}{fraction_installed};
                 my $modules = $_->{modules};
@@ -775,9 +793,8 @@ sub get_candidate_cpan_dist_releases {
 
     for my $hit (@$hits) {
         $hit->{release_id} = delete $hit->{_parent};
-        # add version_obj for convenience
-        $hit->{fields}{version_obj} = eval { version->parse($hit->{fields}{version}) }
-            or die "get_candidate_cpan_dist_releases($module, $version, $file_size): error parsing $hit->{path} $hit->{fields}{version}: $@";
+        # add version_obj for convenience (will fail and be undef for releases like "0.08124-TRIAL")
+        $hit->{fields}{version_obj} = eval { version->parse($hit->{fields}{version}) };
     }
 
     # we'll return { "Dist-Name-Version" => { details }, ... }
@@ -839,9 +856,8 @@ sub get_candidate_cpan_dist_releases_fallback {
 
     for my $hit (@$hits) {
         $hit->{release_id} = delete $hit->{_parent};
-        # add version_obj for convenience
-        $hit->{fields}{version_obj} = eval { version->parse($hit->{fields}{version}) }
-            or die "get_candidate_cpan_dist_releases_fallback($module, $version): error parsing $hit->{version}: $@";
+        # add version_obj for convenience (will fail and be undef for releases like "0.08124-TRIAL")
+        $hit->{fields}{version_obj} = eval { version->parse($hit->{fields}{version}) };
     }
 
     # we'll return { "Dist-Name-Version" => { details }, ... }
@@ -913,11 +929,12 @@ sub get_module_versions_in_release {
                 my $version_obj = eval { version->parse($mod->{version}) };
                 die "$author/$release: $mod $mod->{version}: $@" if $@;
 
-                # XXX could add a show-only-once cache here
-                my $msg = "$mod->{name} $mod->{version} ($size) seen in $path after $prev->{path} $prev->{version} ($prev->{size})";
-                warn "$release: $msg\n"
-                    if $opt_verbose
-                    and ($version_obj != version->parse($prev->{version}) or $size != $prev->{size});
+                if ($opt_verbose) {
+                    # XXX could add a show-only-once cache here
+                    my $msg = "$mod->{name} $mod->{version} ($size) seen in $path after $prev->{path} $prev->{version} ($prev->{size})";
+                    warn "$release: $msg\n"
+                        if ($version_obj != version->parse($prev->{version}) or $size != $prev->{size});
+                }
             }
 
             # keep result small as Storable thawing this is major runtime cost
@@ -1065,18 +1082,23 @@ sub perllocal_distro_mod_version {
         warn "Only first perllocal.pod file will be processed: @$perllocalpod\n"
             if @$perllocalpod > 1;
 
+        $perllocal_distro_mod_version = {};
         # extract data from perllocal.pod
         if (my $plp = shift @$perllocalpod) {
-            # The VERSION is that of the 'main module' not the distro
-            my $p = ExtUtils::Perllocal::Parser->new;
-            $perllocal_distro_mod_version = { map {
-                $_->name => $_->{data}{VERSION}
-            } $p->parse_from_file($plp) };
-            warn "Details of ".keys(%$perllocal_distro_mod_version)." distributions found in $plp\n";
+            # The VERSION isn't always the same as that in the distro file
+            if (eval { require ExtUtils::Perllocal::Parser }) {
+                my $p = ExtUtils::Perllocal::Parser->new;
+                $perllocal_distro_mod_version = { map {
+                    $_->name => $_->{data}{VERSION}
+                } $p->parse_from_file($plp) };
+                warn "Details of ".keys(%$perllocal_distro_mod_version)." distributions found in $plp\n";
+            }
+            else {
+                warn "Wanted to use perllocal.pod but can't because ExtUtils::Perllocal::Parser isn't available\n";
+            }
         }
         else {
             warn "No perllocal.pod found to aid disambiguation\n";
-            $perllocal_distro_mod_version = {};
         }
     }
 
